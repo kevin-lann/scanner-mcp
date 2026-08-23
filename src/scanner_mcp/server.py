@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from io import StringIO
 from typing import Annotated, Any, Literal
 
+import anyio
 from pydantic import Field
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
 
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
@@ -27,17 +32,23 @@ from scanner_mcp.market.service import (
 from scanner_mcp.mcp_schemas import YFINANCE_PERIOD_DESC
 from scanner_mcp.research.forward_returns import forward_returns_markdown
 from scanner_mcp.runtime import (
+    SCAN_TRIGGER_SECRET_ENV,
+    SCAN_TRIGGER_SECRET_HEADER,
     configure_logging,
     get_provider,
     get_request_user_id,
+    get_scheduler_mode,
     get_store,
     install_signal_handlers,
     lifespan,
     restore_signal_handlers,
+    scan_trigger_authorized,
     start_scan_job,
     shutdown_scheduler,
     scan_job_payload,
 )
+from scanner_mcp.scanner import scheduler as scan_sched
+from scanner_mcp.scanner.scheduler import ET
 from scanner_mcp.signals.catalog import list_catalog_entries
 from scanner_mcp.signals.service import create_signal_payload, run_scan_payload
 
@@ -926,6 +937,28 @@ def resource_forward_returns(symbol: str, event_type: str) -> str:
     URI path `symbol`: yfinance ticker. `event_type`: `rsi_oversold` or `rsi_overbought` (same as `chart_forward_returns`).
     """
     return forward_returns_markdown(get_provider(), symbol, event_type)
+
+
+@mcp.custom_route("/internal/scan-tick", methods=["POST"])
+async def internal_scan_tick(request: Request) -> Response:
+    """Run one signal-scan tick, for an external scheduler (e.g. Cloud Scheduler) to call.
+
+    Only meaningful when `SCANNER_MCP_SCHEDULER_MODE=external` (see `runtime.lifespan`),
+    where the in-process APScheduler is intentionally not started. Guarded by a shared
+    secret (`SCAN_TRIGGER_SECRET`), mandatory in external mode.
+    """
+    mode = get_scheduler_mode()
+    expected_secret = os.environ.get(SCAN_TRIGGER_SECRET_ENV)
+    provided_secret = request.headers.get(SCAN_TRIGGER_SECRET_HEADER)
+    if not scan_trigger_authorized(provided_secret, expected_secret, mode):
+        status = 503 if not (expected_secret or "").strip() else 401
+        return JSONResponse({"error": "unauthorized"}, status_code=status)
+
+    at_time = datetime.now(ET).strftime("%H:%M")
+    result = await anyio.to_thread.run_sync(
+        lambda: scan_sched.run_full_scan(get_store(), get_provider(), notify=True, at_time=at_time)
+    )
+    return JSONResponse({"ok": True, "at_time": at_time, **result})
 
 
 def main() -> None:

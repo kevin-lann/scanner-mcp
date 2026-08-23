@@ -7,6 +7,7 @@ import os
 import re
 from typing import Any, Callable
 
+from scanner_mcp.data.concurrent_fetch import fetch_histories_concurrently
 from scanner_mcp.data.exchange_universe import fetch_exchange_tickers
 from scanner_mcp.data.provider import DataProvider
 from scanner_mcp.db.store import DEFAULT_USER_ID, SignalRow, Store
@@ -283,11 +284,10 @@ def execute_scan(
         errors: list[dict[str, str]] = []
         checked = 0
         total_count = len(tick_list) * len(CATALOG)
-        for ticker in tick_list:
+        fetch_requests = [(ticker, {"period": "1y", "interval": "1d"}) for ticker in tick_list]
+        for ticker, df, exc in fetch_histories_concurrently(provider, fetch_requests, cancel_check=cancel_check):
             _raise_if_cancelled()
-            try:
-                df = provider.get_history(ticker, period="1y", interval="1d")
-            except Exception as exc:  # noqa: BLE001
+            if exc is not None:
                 errors.append({"symbol": ticker, "error": str(exc)})
                 if progress_callback:
                     progress_callback(checked, len(triggered_results), len(triggered_results), total_count)
@@ -363,12 +363,13 @@ def execute_scan(
             history_period=getattr(signal_row, "history_period", "1y"),
             interval=getattr(signal_row, "interval", "1d"),
         )
-        for ticker in universe:
+        fetch_requests = [
+            (ticker, {"period": signal.history_period, "interval": signal.interval}) for ticker in universe
+        ]
+        for ticker, df, exc in fetch_histories_concurrently(provider, fetch_requests, cancel_check=cancel_check):
             _raise_if_cancelled()
             checked_count += 1
-            try:
-                df = provider.get_history(ticker, period=signal.history_period, interval=signal.interval)
-            except Exception as exc:  # noqa: BLE001
+            if exc is not None:
                 ticker_errors.append({"symbol": ticker, "signal_id": signal_row.id, "error": str(exc)})
                 if progress_callback:
                     progress_callback(checked_count, fired_count, len(results), total_count)
