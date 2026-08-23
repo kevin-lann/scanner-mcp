@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
 
+from scanner_mcp import runtime
 from scanner_mcp.db.store import SignalRow, Store
 from scanner_mcp.scanner import scheduler
 from scanner_mcp.signals import service as signals_service
@@ -161,6 +165,78 @@ class SchedulerTest(unittest.TestCase):
             fired_signal_ids = {a["signal_id"] for a in result["alerts"]}
             self.assertEqual(fired_signal_ids, {due_sid})
             self.assertNotIn(not_due_sid, fired_signal_ids)
+
+    def test_run_full_scan_fetches_tickers_concurrently(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td) / "test.db")
+            tickers = [f"T{i}" for i in range(6)]
+            store.watchlist_add("user-a", tickers)
+            store.signal_create("user-a", "RSI", "rsi_oversold", {}, None)
+
+            lock = threading.Lock()
+            state = {"concurrent": 0, "peak": 0}
+
+            class SlowProvider:
+                def get_history(self, symbol: str, *, period: str, interval: str) -> pd.DataFrame:
+                    with lock:
+                        state["concurrent"] += 1
+                        state["peak"] = max(state["peak"], state["concurrent"])
+                    time.sleep(0.05)
+                    with lock:
+                        state["concurrent"] -= 1
+                    return pd.DataFrame({"Close": [1.0, 2.0]})
+
+            with (
+                patch.dict(os.environ, {"SCANNER_MCP_FETCH_WORKERS": "6"}),
+                patch("scanner_mcp.scanner.scheduler.evaluate", return_value=(False, {})),
+            ):
+                result = scheduler.run_full_scan(store, SlowProvider(), notify=False)  # type: ignore[arg-type]
+
+            self.assertEqual(result["checked"], len(tickers))
+            self.assertGreater(state["peak"], 1)
+
+
+class SchedulerModeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_lifespan_starts_apscheduler_by_default(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch.object(runtime, "get_store", return_value="store"),
+            patch.object(runtime, "get_provider", return_value="provider"),
+            patch("scanner_mcp.scanner.scheduler.start_scheduler") as start_mock,
+        ):
+            os.environ.pop("SCANNER_MCP_SCHEDULER_MODE", None)
+            async with runtime.lifespan(object()):  # type: ignore[arg-type]
+                pass
+            start_mock.assert_called_once_with("store", "provider")
+
+    async def test_lifespan_skips_apscheduler_in_external_mode(self) -> None:
+        with (
+            patch.dict(os.environ, {"SCANNER_MCP_SCHEDULER_MODE": "external"}),
+            patch.object(runtime, "get_store", return_value="store"),
+            patch.object(runtime, "get_provider", return_value="provider"),
+            patch("scanner_mcp.scanner.scheduler.start_scheduler") as start_mock,
+        ):
+            async with runtime.lifespan(object()):  # type: ignore[arg-type]
+                pass
+            start_mock.assert_not_called()
+
+    def test_get_scheduler_mode_rejects_unrecognized_value(self) -> None:
+        with patch.dict(os.environ, {"SCANNER_MCP_SCHEDULER_MODE": "bogus"}):
+            with self.assertRaises(RuntimeError):
+                runtime.get_scheduler_mode()
+
+    def test_scan_trigger_authorized_requires_secret_in_external_mode(self) -> None:
+        self.assertFalse(runtime.scan_trigger_authorized(None, None, "external"))
+        self.assertFalse(runtime.scan_trigger_authorized("anything", "", "external"))
+
+    def test_scan_trigger_authorized_skips_check_when_secret_unset_locally(self) -> None:
+        self.assertTrue(runtime.scan_trigger_authorized(None, None, "apscheduler"))
+
+    def test_scan_trigger_authorized_enforces_match_when_secret_set(self) -> None:
+        self.assertTrue(runtime.scan_trigger_authorized("s3cr3t", "s3cr3t", "apscheduler"))
+        self.assertFalse(runtime.scan_trigger_authorized("wrong", "s3cr3t", "apscheduler"))
+        self.assertTrue(runtime.scan_trigger_authorized("s3cr3t", "s3cr3t", "external"))
+        self.assertFalse(runtime.scan_trigger_authorized("wrong", "s3cr3t", "external"))
 
 
 class ExecuteScanAlertPersistenceTest(unittest.TestCase):

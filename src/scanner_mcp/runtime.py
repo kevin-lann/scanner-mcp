@@ -29,6 +29,43 @@ _scan_executor: ThreadPoolExecutor | None = None
 _scan_futures: dict[int, Future[None]] = {}
 TRANSPORT_USER_ID_HEADER = "x-scanner-user-id"
 STDIO_USER_ID_ENV = "SCANNER_MCP_USER_ID"
+SCHEDULER_MODE_ENV = "SCANNER_MCP_SCHEDULER_MODE"
+SCHEDULER_MODE_APSCHEDULER = "apscheduler"
+SCHEDULER_MODE_EXTERNAL = "external"
+SCAN_TRIGGER_SECRET_ENV = "SCAN_TRIGGER_SECRET"
+SCAN_TRIGGER_SECRET_HEADER = "x-scan-trigger-secret"
+
+
+def scan_trigger_authorized(provided: str | None, expected: str | None, mode: str) -> bool:
+    """Authorize a call to `/internal/scan-tick`.
+
+    In `external` mode `expected` (from `SCAN_TRIGGER_SECRET`) is mandatory: an
+    unset secret always denies, so production can never end up with an
+    unauthenticated tick endpoint by accident. In `apscheduler` (local/dev) mode,
+    an unset secret allows any caller through, for frictionless local curl testing;
+    if the developer does set it locally, it's still enforced.
+    """
+    expected = (expected or "").strip()
+    if not expected:
+        return mode != SCHEDULER_MODE_EXTERNAL
+    return (provided or "").strip() == expected
+
+
+def get_scheduler_mode() -> str:
+    """Resolve the scheduler mode: in-process APScheduler (default) or external trigger.
+
+    `external` is for the production Cloud Run deployment, where an outside Cloud
+    Scheduler job ticks `/internal/scan-tick` once a minute instead -- Cloud Run's
+    default billing throttles CPU between requests, which would otherwise silently
+    stall an in-process per-minute cron. Local/stdio and docker-compose usage never
+    set this, so they keep running the in-process scheduler unchanged.
+    """
+    mode = os.environ.get(SCHEDULER_MODE_ENV, SCHEDULER_MODE_APSCHEDULER).strip().lower()
+    if mode not in (SCHEDULER_MODE_APSCHEDULER, SCHEDULER_MODE_EXTERNAL):
+        raise RuntimeError(
+            f"{SCHEDULER_MODE_ENV} must be {SCHEDULER_MODE_APSCHEDULER!r} or {SCHEDULER_MODE_EXTERNAL!r}, got {mode!r}"
+        )
+    return mode
 
 
 def shutdown_scheduler() -> None:
@@ -240,10 +277,13 @@ async def lifespan(_: FastMCP) -> AsyncIterator[dict[str, Any]]:
     global _sched
     st = get_store()
     provider = get_provider()
-    try:
-        _sched = scan_sched.start_scheduler(st, provider)
-    except Exception as exc:  # noqa: BLE001
-        log.error("Could not start scheduler: %s", exc)
+    if get_scheduler_mode() == SCHEDULER_MODE_APSCHEDULER:
+        try:
+            _sched = scan_sched.start_scheduler(st, provider)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Could not start scheduler: %s", exc)
+    else:
+        log.info("Scheduler mode is external: skipping in-process APScheduler, expecting /internal/scan-tick calls")
     try:
         yield {"store": st, "provider": provider, "scheduler": _sched}
     finally:

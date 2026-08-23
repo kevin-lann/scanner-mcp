@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
 
+from scanner_mcp.data.concurrent_fetch import fetch_histories_concurrently
 from scanner_mcp.data.exchange_universe import fetch_exchange_tickers
 from scanner_mcp.data.provider import DataProvider
 from scanner_mcp.db.store import SignalRow, Store
@@ -100,12 +101,13 @@ def run_full_scan(
                 history_period=srow.history_period,
                 interval=srow.interval,
             )
-            for sym in tickers:
+            fetch_requests = [
+                (sym, {"period": asig.history_period, "interval": asig.interval}) for sym in tickers
+            ]
+            for sym, df, exc in fetch_histories_concurrently(provider, fetch_requests):
                 result["checked"] += 1
-                try:
-                    df = provider.get_history(sym, period=asig.history_period, interval=asig.interval)
-                except Exception as e:  # noqa: BLE001
-                    log.debug("history %s: %s", sym, e)
+                if exc is not None:
+                    log.debug("history %s: %s", sym, exc)
                     continue
                 if df is None or df.empty:
                     continue
