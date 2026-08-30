@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from io import StringIO
@@ -576,6 +577,23 @@ def get_scan_status(job_id: int) -> str:
     """
     user_id = get_request_user_id()
     payload = scan_job_payload(job_id, user_id)
+
+    # Long-poll: hold the response open (bounded) while the job is still in
+    # flight instead of returning immediately. A scan over hundreds of symbols
+    # needs many polls at the old fixed 2s client cadence, which can exceed a
+    # caller's own per-turn tool-call budget (e.g. the web chat backend caps
+    # tool-call steps per turn) before the job actually finishes -- the caller
+    # then reports whatever partial `checked_count` it last saw as if it were
+    # final. Waiting here means each poll covers more real scan progress.
+    deadline = time.monotonic() + 8.0
+    while (
+        "error" not in payload
+        and payload["status"] in {"queued", "running"}
+        and time.monotonic() < deadline
+    ):
+        time.sleep(1.0)
+        payload = scan_job_payload(job_id, user_id)
+
     if "error" not in payload and payload["status"] in {"queued", "running"}:
         payload["poll_after_seconds"] = 2
         payload["next_action"] = f"Poll get_scan_status({job_id}) again after a short delay."
