@@ -8,6 +8,7 @@ import io
 import logging
 import os
 from pathlib import Path
+import threading
 from uuid import uuid4
 
 import numpy as np
@@ -18,6 +19,15 @@ log = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _OUTPUT_DIR = _PROJECT_ROOT / "output"
+
+# Each kaleido render boots its own headless Chromium process (150-300MB+ RSS).
+# Tool calls run concurrently (one per chat request), so without a cap, a burst
+# of chart requests can spawn enough Chromium instances to OOM the container.
+# Extra calls beyond the limit block here rather than piling on more renders.
+_MAX_CONCURRENT_CHART_RENDERS = max(
+    1, int(os.environ.get("SCANNER_MCP_CHART_RENDER_WORKERS", "2"))
+)
+_CHART_RENDER_SEMAPHORE = threading.Semaphore(_MAX_CONCURRENT_CHART_RENDERS)
 
 
 def debug_png_enabled() -> bool:
@@ -60,7 +70,10 @@ def fig_to_b64(fig: go.Figure, chart_type: str) -> str:
     """Render a Plotly figure to PNG bytes, save a debug copy, and return base64."""
     fig = go.Figure(_json_safe_plotly_value(fig.to_dict()))
     buf = io.BytesIO()
-    fig.write_image(buf, format="png", engine="kaleido", scale=1.5)
+    with _CHART_RENDER_SEMAPHORE:
+        # No `engine=` kwarg: plotly 7.x removed it (kaleido is the only engine now)
+        # and passing it raises TypeError. Omitting it works on both 6.x and 7.x.
+        fig.write_image(buf, format="png", scale=1.5)
     buf.seek(0)
     png_bytes = buf.getvalue()
     if debug_png_enabled():
