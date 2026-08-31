@@ -134,15 +134,39 @@ class Store:
         """
         if self._turso_url:
             c = self._acquire_libsql_connection()
+            healthy = True
             try:
                 c.execute("PRAGMA foreign_keys = ON")
                 yield c
                 c.commit()
             except Exception:
-                c.rollback()
+                healthy = False
+                try:
+                    c.rollback()
+                except Exception:
+                    # The connection itself is likely what's broken (e.g. a
+                    # Turso/Hrana stream that expired server-side after being
+                    # idle) -- rollback failing the same way just confirms it.
+                    # Swallow this so the original exception below is what
+                    # the caller sees.
+                    pass
                 raise
             finally:
-                self._libsql_pool.put(c)  # type: ignore[union-attr]
+                if healthy:
+                    self._libsql_pool.put(c)  # type: ignore[union-attr]
+                else:
+                    # Never recycle a connection that failed mid-use: Turso's
+                    # Hrana streams expire after enough idle time (e.g. the
+                    # once-a-minute scan-tick job), and putting a dead stream
+                    # back in the pool just means the next caller to draw it
+                    # hits the exact same error forever, since nothing else
+                    # here ever replaces it. `None` means the next checkout
+                    # lazily opens a fresh connection instead.
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+                    self._libsql_pool.put(None)  # type: ignore[union-attr]
         else:
             with self._lock:
                 c = sqlite3.connect(self._path)
