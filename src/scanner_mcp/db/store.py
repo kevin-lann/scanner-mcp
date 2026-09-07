@@ -568,11 +568,19 @@ class Store:
             return int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
 
     def alerts_recent(self, user_id: str, limit: int = 50) -> list[AlertRow]:
-        """Return one user's newest alert rows, newest first."""
+        """Return one user's newest alert rows, newest first.
+
+        Orders by `id DESC` as a tiebreaker after `triggered_at` — a single
+        scan tick fires many signals with the identical timestamp, and
+        without a deterministic secondary key SQLite doesn't guarantee which
+        of those ties land on either side of the `LIMIT` boundary (or their
+        relative order) across separate queries, which surfaced as alerts
+        seeming to appear/disappear between requests a few seconds apart.
+        """
         user_id = _normalize_user_id(user_id)
         with self._conn() as c:
             rows = c.execute(
-                "SELECT * FROM alerts WHERE user_id = ? ORDER BY triggered_at DESC LIMIT ?",
+                "SELECT * FROM alerts WHERE user_id = ? ORDER BY triggered_at DESC, id DESC LIMIT ?",
                 (user_id, limit),
             )
             return [_row_to_alert(r) for r in rows]
